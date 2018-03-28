@@ -27,7 +27,6 @@
  * WE ASSUME NO MALLEABILITY!  This requires segregated witness.
  */
 #include <bitcoin/script.h>
-#include <bitcoin/tx.h>
 #include <ccan/crypto/siphash24/siphash24.h>
 #include <ccan/ptrint/ptrint.h>
 #include <ccan/structeq/structeq.h>
@@ -39,6 +38,39 @@
 #include <lightningd/log.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/watch.h>
+
+/* Watching an output */
+struct txowatch {
+	struct chain_topology *topo;
+
+	/* Channel who owns us. */
+	struct channel *channel;
+
+	/* Output to watch. */
+	struct txwatch_output out;
+
+	/* A new tx. */
+	enum watch_result (*cb)(struct channel *channel,
+				const struct bitcoin_tx *tx,
+				size_t input_num,
+				const struct block *block);
+};
+
+struct txwatch {
+	struct chain_topology *topo;
+
+	/* Channel who owns us. */
+	struct channel *channel;
+
+	/* Transaction to watch. */
+	struct bitcoin_txid txid;
+	unsigned int depth;
+
+	/* A new depth (0 if kicked out, otherwise 1 = tip, etc.) */
+	enum watch_result (*cb)(struct channel *channel,
+				const struct bitcoin_tx *tx,
+				unsigned int depth);
+};
 
 const struct txwatch_output *txowatch_keyof(const struct txowatch *w)
 {
@@ -86,15 +118,13 @@ static void destroy_txwatch(struct txwatch *w)
 	txwatch_hash_del(&w->topo->txwatches, w);
 }
 
-struct txwatch *watch_txid_(const tal_t *ctx,
-			    struct chain_topology *topo,
-			    struct peer *peer,
-			    const struct bitcoin_txid *txid,
-			    enum watch_result (*cb)(struct peer *peer,
+struct txwatch *watch_txid(const tal_t *ctx,
+			   struct chain_topology *topo,
+			   struct channel *channel,
+			   const struct bitcoin_txid *txid,
+			   enum watch_result (*cb)(struct channel *channel,
 						    const struct bitcoin_tx *,
-						    unsigned int depth,
-						    void *arg),
-			    void *cb_arg)
+						    unsigned int depth))
 {
 	struct txwatch *w;
 
@@ -102,9 +132,8 @@ struct txwatch *watch_txid_(const tal_t *ctx,
 	w->topo = topo;
 	w->depth = 0;
 	w->txid = *txid;
-	w->peer = peer;
+	w->channel = channel;
 	w->cb = cb;
-	w->cbdata = cb_arg;
 
 	txwatch_hash_add(&w->topo->txwatches, w);
 	tal_add_destructor(w, destroy_txwatch);
@@ -114,17 +143,17 @@ struct txwatch *watch_txid_(const tal_t *ctx,
 
 struct txwatch *find_txwatch(struct chain_topology *topo,
 			     const struct bitcoin_txid *txid,
-			     const struct peer *peer)
+			     const struct channel *channel)
 {
 	struct txwatch_hash_iter i;
 	struct txwatch *w;
 
-	/* We could have more than one peer watching same txid, though we
+	/* We could have more than one channel watching same txid, though we
 	 * don't for onchaind. */
 	for (w = txwatch_hash_getfirst(&topo->txwatches, txid, &i);
 	     w;
 	     w = txwatch_hash_getnext(&topo->txwatches, txid, &i)) {
-		if (w->peer == peer)
+		if (w->channel == channel)
 			break;
 	}
 	return w;
@@ -136,42 +165,37 @@ bool watching_txid(const struct chain_topology *topo,
 	return txwatch_hash_get(&topo->txwatches, txid) != NULL;
 }
 
-struct txwatch *watch_tx_(const tal_t *ctx,
-			  struct chain_topology *topo,
-			  struct peer *peer,
-			  const struct bitcoin_tx *tx,
-			  enum watch_result (*cb)(struct peer *peer,
+struct txwatch *watch_tx(const tal_t *ctx,
+			 struct chain_topology *topo,
+			 struct channel *channel,
+			 const struct bitcoin_tx *tx,
+			 enum watch_result (*cb)(struct channel *channel,
 						  const struct bitcoin_tx *,
-						  unsigned int depth,
-						  void *arg),
-			  void *cb_arg)
+						  unsigned int depth))
 {
 	struct bitcoin_txid txid;
 
 	bitcoin_txid(tx, &txid);
-	return watch_txid(ctx, topo, peer, &txid, cb, cb_arg);
+	return watch_txid(ctx, topo, channel, &txid, cb);
 }
 
-struct txowatch *watch_txo_(const tal_t *ctx,
-			    struct chain_topology *topo,
-			    struct peer *peer,
-			    const struct bitcoin_txid *txid,
-			    unsigned int output,
-			    enum watch_result (*cb)(struct peer *peer,
-						    const struct bitcoin_tx *tx,
-						    size_t input_num,
-						    const struct block *block,
-						    void *),
-			    void *cbdata)
+struct txowatch *watch_txo(const tal_t *ctx,
+			   struct chain_topology *topo,
+			   struct channel *channel,
+			   const struct bitcoin_txid *txid,
+			   unsigned int output,
+			   enum watch_result (*cb)(struct channel *channel,
+						   const struct bitcoin_tx *tx,
+						   size_t input_num,
+						   const struct block *block))
 {
 	struct txowatch *w = tal(ctx, struct txowatch);
 
 	w->topo = topo;
 	w->out.txid = *txid;
 	w->out.index = output;
-	w->peer = peer;
+	w->channel = channel;
 	w->cb = cb;
-	w->cbdata = cbdata;
 
 	txowatch_hash_add(&w->topo->txowatches, w);
 	tal_add_destructor(w, destroy_txowatch);
@@ -180,8 +204,7 @@ struct txowatch *watch_txo_(const tal_t *ctx,
 }
 
 /* Returns true if we fired a callback */
-static bool txw_fire(struct chain_topology *topo,
-		     struct txwatch *txw,
+static bool txw_fire(struct txwatch *txw,
 		     const struct bitcoin_tx *tx,
 		     unsigned int depth)
 {
@@ -189,12 +212,12 @@ static bool txw_fire(struct chain_topology *topo,
 
 	if (depth == txw->depth)
 		return false;
-	log_debug(txw->peer->log,
+	log_debug(txw->channel->log,
 		  "Got depth change %u->%u for %s",
 		  txw->depth, depth,
-		  type_to_string(ltmp, struct bitcoin_txid, &txw->txid));
+		  type_to_string(tmpctx, struct bitcoin_txid, &txw->txid));
 	txw->depth = depth;
-	r = txw->cb(txw->peer, tx, txw->depth, txw->cbdata);
+	r = txw->cb(txw->channel, tx, txw->depth);
 	switch (r) {
 	case DELETE_WATCH:
 		tal_free(txw);
@@ -216,11 +239,10 @@ void txwatch_fire(struct chain_topology *topo,
 	txw = txwatch_hash_get(&topo->txwatches, &txid);
 
 	if (txw)
-		txw_fire(topo, txw, tx, depth);
+		txw_fire(txw, tx, depth);
 }
 
-void txowatch_fire(struct chain_topology *topo,
-		   const struct txowatch *txow,
+void txowatch_fire(const struct txowatch *txow,
 		   const struct bitcoin_tx *tx,
 		   size_t input_num,
 		   const struct block *block)
@@ -229,13 +251,13 @@ void txowatch_fire(struct chain_topology *topo,
 	enum watch_result r;
 
 	bitcoin_txid(tx, &txid);
-	log_debug(txow->peer->log,
+	log_debug(txow->channel->log,
 		  "Got UTXO spend for %s:%u: %s",
-		  type_to_string(ltmp, struct bitcoin_txid, &txow->out.txid),
+		  type_to_string(tmpctx, struct bitcoin_txid, &txow->out.txid),
 		  txow->out.index,
-		  type_to_string(ltmp, struct bitcoin_txid, &txid));
+		  type_to_string(tmpctx, struct bitcoin_txid, &txid));
 
-	r = txow->cb(txow->peer, tx, input_num, block, txow->cbdata);
+	r = txow->cb(txow->channel, tx, input_num, block);
 	switch (r) {
 	case DELETE_WATCH:
 		tal_free(txow);
@@ -263,7 +285,7 @@ again:
 
 		depth = get_tx_depth(topo, &w->txid, &tx);
 		if (depth)
-			needs_rerun |= txw_fire(topo, w, tx, depth);
+			needs_rerun |= txw_fire(w, tx, depth);
 	}
 	if (needs_rerun)
 		goto again;

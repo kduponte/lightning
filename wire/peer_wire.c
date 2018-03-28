@@ -31,9 +31,9 @@ static bool unknown_type(enum wire_type t)
 	return true;
 }
 
-bool is_gossip_msg(const u8 *cursor)
+bool is_msg_for_gossipd(const u8 *cursor)
 {
-	switch (fromwire_peektype(cursor)) {
+	switch ((enum wire_type)fromwire_peektype(cursor)) {
 	case WIRE_CHANNEL_ANNOUNCEMENT:
 	case WIRE_NODE_ANNOUNCEMENT:
 	case WIRE_CHANNEL_UPDATE:
@@ -56,15 +56,11 @@ bool is_gossip_msg(const u8 *cursor)
 	case WIRE_UPDATE_FEE:
 	case WIRE_PING:
 	case WIRE_PONG:
+	case WIRE_CHANNEL_REESTABLISH:
+	case WIRE_ANNOUNCEMENT_SIGNATURES:
 		break;
 	}
 	return false;
-}
-
-/* Return true if it's an unknown message.  cursor is a tal ptr. */
-bool is_unknown_msg(const u8 *cursor)
-{
-	return unknown_type(fromwire_peektype(cursor));
 }
 
 /* Return true if it's an unknown ODD message.  cursor is a tal ptr. */
@@ -84,10 +80,10 @@ bool extract_channel_id(const u8 *in_pkt, struct channel_id *channel_id)
 	struct pubkey ignored_pubkey;
 	struct bitcoin_blkid ignored_chainhash;
 
-	if (fromwire_channel_reestablish(in_pkt, NULL, channel_id,
+	if (fromwire_channel_reestablish(in_pkt, channel_id,
 					 &ignored_u64, &ignored_u64))
 		return true;
-	if (fromwire_open_channel(in_pkt, NULL, &ignored_chainhash,
+	if (fromwire_open_channel(in_pkt, &ignored_chainhash,
 				  channel_id, &ignored_u64,
 				  &ignored_u64, &ignored_u64,
 				  &ignored_u64, &ignored_u64,

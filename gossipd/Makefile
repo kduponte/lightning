@@ -13,6 +13,7 @@ LIGHTNINGD_GOSSIP_CONTROL_OBJS := $(LIGHTNINGD_GOSSIP_CONTROL_SRC:.c=.o)
 
 # gossipd needs these:
 LIGHTNINGD_GOSSIP_HEADERS := gossipd/gen_gossip_wire.h \
+	gossipd/gossip_store.h				\
 	gossipd/handshake.h				\
 	gossipd/routing.h				\
 	gossipd/broadcast.h
@@ -41,11 +42,13 @@ GOSSIPD_COMMON_OBJS :=				\
 	common/daemon_conn.o			\
 	common/dev_disconnect.o			\
 	common/features.o			\
+	common/gen_status_wire.o		\
 	common/io_debug.o			\
 	common/msg_queue.o			\
 	common/ping.o				\
 	common/pseudorand.o			\
 	common/status.o				\
+	common/status_wire.o			\
 	common/subdaemon.o			\
 	common/timeout.o			\
 	common/type_to_string.o			\

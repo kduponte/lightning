@@ -23,17 +23,21 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/derive_basepoints.o		\
 	common/features.o			\
 	common/funding_tx.o			\
+	common/gen_peer_status_wire.o		\
+	common/gen_status_wire.o		\
 	common/hash_u5.o			\
 	common/htlc_state.o			\
 	common/htlc_wire.o			\
 	common/io_debug.o			\
 	common/key_derive.o			\
 	common/json.o				\
+	common/json_escaped.o			\
 	common/memleak.o			\
 	common/msg_queue.o			\
 	common/permute_tx.o			\
 	common/pseudorand.o			\
 	common/sphinx.o				\
+	common/status_wire.o			\
 	common/timeout.o			\
 	common/type_to_string.o			\
 	common/utils.o				\
@@ -47,22 +51,30 @@ LIGHTNINGD_SRC :=				\
 	lightningd/bitcoind.c			\
 	lightningd/build_utxos.c		\
 	lightningd/chaintopology.c		\
+	lightningd/channel.c			\
+	lightningd/channel_control.c		\
+	lightningd/closing_control.c		\
+	lightningd/connect_control.c		\
 	lightningd/gossip_control.c		\
 	lightningd/gossip_msg.c			\
 	lightningd/hsm_control.c		\
 	lightningd/htlc_end.c			\
 	lightningd/invoice.c			\
+	lightningd/json.c			\
 	lightningd/jsonrpc.c			\
 	lightningd/lightningd.c			\
 	lightningd/log.c			\
+	lightningd/log_status.c			\
 	lightningd/netaddress.c			\
+	lightningd/onchain_control.c		\
+	lightningd/opening_control.c		\
 	lightningd/opt_time.c			\
 	lightningd/options.c			\
 	lightningd/pay.c			\
+	lightningd/payalgo.c			\
 	lightningd/peer_control.c		\
 	lightningd/peer_htlcs.c			\
 	lightningd/subd.c			\
-	lightningd/txfilter.c			\
 	lightningd/watch.c
 
 # Source files without corresponding headers
@@ -78,11 +90,12 @@ ALL_OBJS += $(LIGHTNINGD_OBJS)
 # We accumulate all lightningd/ headers in these three:
 LIGHTNINGD_HEADERS_NOGEN =			\
 	$(LIGHTNINGD_SRC:.c=.h)			\
-	lightningd/peer_state.h
+	lightningd/channel_state.h			\
+	lightningd/jsonrpc_errors.h
 
 # Generated headers
 LIGHTNINGD_HEADERS_GEN =			\
-	lightningd/gen_peer_state_names.h
+	lightningd/gen_channel_state_names.h
 
 ALL_GEN_HEADERS += $(LIGHTNINGD_HEADERS_GEN)
 
@@ -91,8 +104,8 @@ LIGHTNINGD_HEADERS = $(LIGHTNINGD_HEADERS_NOGEN) $(LIGHTNINGD_HEADERS_GEN) $(EXT
 
 $(LIGHTNINGD_OBJS): $(LIGHTNINGD_HEADERS)
 
-lightningd/gen_peer_state_names.h: lightningd/peer_state.h ccan/ccan/cdump/tools/cdump-enumstr
-	ccan/ccan/cdump/tools/cdump-enumstr lightningd/peer_state.h > $@
+lightningd/gen_channel_state_names.h: lightningd/channel_state.h ccan/ccan/cdump/tools/cdump-enumstr
+	ccan/ccan/cdump/tools/cdump-enumstr lightningd/channel_state.h > $@
 
 check-source: $(LIGHTNINGD_SRC:%=check-src-include-order/%) $(LIGHTNINGD_SRC_NOHDR:%=check-src-include-order/%)
 check-source: $(LIGHTNINGD_HEADERS_NOGEN:%=check-hdr-include-order/%)

@@ -1,5 +1,6 @@
 #include <ccan/structeq/structeq.h>
 #include <common/crypto_sync.h>
+#include <common/peer_failed.h>
 #include <common/ping.h>
 #include <common/read_peer_msg.h>
 #include <common/status.h>
@@ -16,36 +17,34 @@ static void handle_ping(const u8 *msg,
 			const struct channel_id *channel,
 			bool (*send_reply)(struct crypto_state *, int,
 					   const u8 *, void *),
-			void (*io_error)(const char *, void *),
+			void (*io_error)(void *),
 			void *arg)
 {
 	u8 *pong;
 
 	if (!check_ping_make_pong(msg, msg, &pong)) {
 		send_reply(cs, peer_fd,
-			   take(towire_errorfmt(msg, channel,
+			   take(towire_errorfmt(NULL, channel,
 						"Bad ping %s",
 						tal_hex(msg, msg))), arg);
-		io_error("Bad ping received", arg);
+		io_error(arg);
 	}
 
-	status_trace("Got ping, sending %s", pong ?
+	status_debug("Got ping, sending %s", pong ?
 		     wire_type_name(fromwire_peektype(pong))
 		     : "nothing");
 
 	if (pong && !send_reply(cs, peer_fd, pong, arg))
-		io_error("Failed writing pong", arg);
+		io_error(arg);
 }
 
 u8 *read_peer_msg_(const tal_t *ctx,
 		   int peer_fd, int gossip_fd,
-		   struct crypto_state *cs,
+		   struct crypto_state *cs, u64 gossip_index,
 		   const struct channel_id *channel,
-		   bool (*send_reply)(struct crypto_state *, int, const u8 *,
-				      void *),
-		   void (*io_error)(const char *what_i_was_doing, void *arg),
-		   void (*err_pkt)(const char *desc, bool this_channel_only,
-				   void *arg),
+		   bool (*send_reply)(struct crypto_state *cs, int fd,
+				      const u8 *TAKES,  void *arg),
+		   void (*io_error)(void *arg),
 		   void *arg)
 {
 	u8 *msg;
@@ -53,11 +52,9 @@ u8 *read_peer_msg_(const tal_t *ctx,
 
 	msg = sync_crypto_read(ctx, cs, peer_fd);
 	if (!msg)
-		io_error("reading from peer", arg);
+		io_error(arg);
 
-	status_trace("peer_in %s", wire_type_name(fromwire_peektype(msg)));
-
-	if (is_gossip_msg(msg)) {
+	if (is_msg_for_gossipd(msg)) {
 		/* Forward to gossip daemon */
 		wire_sync_write(gossip_fd, take(msg));
 		return NULL;
@@ -87,10 +84,10 @@ u8 *read_peer_msg_(const tal_t *ctx,
 		 *    message:
 		 *    - MUST ignore the message.
 		 */
-		if (channel_id_is_all(&chanid))
-			err_pkt(err, false, arg);
-		else if (structeq(&chanid, channel))
-			err_pkt(err, true, arg);
+		if (structeq(&chanid, channel) || channel_id_is_all(&chanid))
+			peer_failed_received_errmsg(peer_fd, gossip_fd,
+						    cs, gossip_index,
+						    err, &chanid);
 
 		return tal_free(msg);
 	}
@@ -100,13 +97,13 @@ u8 *read_peer_msg_(const tal_t *ctx,
 	    && !structeq(&chanid, channel)) {
 		status_trace("Rejecting %s for unknown channel_id %s",
 			     wire_type_name(fromwire_peektype(msg)),
-			     type_to_string(msg, struct channel_id, &chanid));
+			     type_to_string(tmpctx, struct channel_id, &chanid));
 		if (!send_reply(cs, peer_fd,
-				take(towire_errorfmt(msg, &chanid,
+				take(towire_errorfmt(NULL, &chanid,
 						     "Multiple channels"
 						     " unsupported")),
 				arg))
-			io_error("Sending error for other channel ", arg);
+			io_error(arg);
 		return tal_free(msg);
 	}
 
@@ -115,20 +112,13 @@ u8 *read_peer_msg_(const tal_t *ctx,
 
 /* Helper: sync_crypto_write, with extra args it ignores */
 bool sync_crypto_write_arg(struct crypto_state *cs, int fd, const u8 *msg,
-			   void *unused)
+			   void *unused UNUSED)
 {
 	return sync_crypto_write(cs, fd, msg);
 }
 
-/* Helper: calls status_failed(STATUS_FAIL_PEER_IO) */
-void status_fail_io(const char *what_i_was_doing, void *unused)
+/* Helper: calls peer_failed_connection_lost. */
+void status_fail_io(void *unused UNUSED)
 {
-	status_failed(STATUS_FAIL_PEER_IO,
-		      "%s:%s", what_i_was_doing, strerror(errno));
-}
-
-/* Helper: calls status_failed(STATUS_FAIL_PEER_BAD, <error>) */
-void status_fail_errpkt(const char *desc, bool this_channel_only, void *unused)
-{
-	status_failed(STATUS_FAIL_PEER_BAD, "Peer sent ERROR: %s", desc);
+	peer_failed_connection_lost();
 }

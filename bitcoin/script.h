@@ -29,18 +29,15 @@ u8 *scriptpubkey_p2sh_hash(const tal_t *ctx, const struct ripemd160 *redeemhash)
 /* Create an output script using p2pkh */
 u8 *scriptpubkey_p2pkh(const tal_t *ctx, const struct bitcoin_address *addr);
 
+/* Create a prunable output script */
+u8 *scriptpubkey_opreturn(const tal_t *ctx);
+
 /* Create an input script which spends p2pkh */
 u8 *bitcoin_redeem_p2pkh(const tal_t *ctx, const struct pubkey *pubkey,
 			 const secp256k1_ecdsa_signature *sig);
 
 /* Create the redeemscript for a P2SH + P2WPKH. */
 u8 *bitcoin_redeem_p2sh_p2wpkh(const tal_t *ctx, const struct pubkey *key);
-
-/* Create a witness which spends the P2SH + P2WPKH. */
-void bitcoin_witness_p2sh_p2wpkh(const tal_t *ctx,
-				 struct bitcoin_tx_input *input,
-				 const secp256k1_ecdsa_signature *sig,
-				 const struct pubkey *key);
 
 /* Create scriptsig for p2sh-p2wpkh */
 u8 *bitcoin_scriptsig_p2sh_p2wpkh(const tal_t *ctx, const struct pubkey *key);
@@ -84,9 +81,6 @@ u8 *bitcoin_wscript_to_local(const tal_t *ctx,
 			     u16 to_self_delay,
 			     const struct pubkey *revocation_pubkey,
 			     const struct pubkey *local_delayedkey);
-u8 **bitcoin_to_local_spend_revocation(const tal_t *ctx,
-		const secp256k1_ecdsa_signature *revocation_sig,
-		const u8 *wscript);
 
 /* BOLT #3 offered/accepted HTLC outputs */
 u8 *bitcoin_wscript_htlc_offer(const tal_t *ctx,

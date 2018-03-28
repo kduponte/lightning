@@ -7,8 +7,10 @@
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/grab_file/grab_file.h>
+#include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
 #include <common/configdir.h>
+#include <common/json_escaped.h>
 #include <common/memleak.h>
 #include <common/version.h>
 #include <common/wireaddr.h>
@@ -65,10 +67,29 @@ static void tal_freefn(void *ptr)
 #define TIME_FROM_MSEC(msec) \
 	{ { .tv_nsec = ((msec) % 1000) * 1000000, .tv_sec = (msec) / 1000 } }
 
+static char *opt_set_u64(const char *arg, u64 *u)
+{
+	char *endp;
+	unsigned long long l;
+
+	assert(arg != NULL);
+
+	/* This is how the manpage says to do it.  Yech. */
+	errno = 0;
+	l = strtoull(arg, &endp, 0);
+	if (*endp || !arg[0])
+		return tal_fmt(NULL, "'%s' is not a number", arg);
+	*u = l;
+	if (errno || *u != l)
+		return tal_fmt(NULL, "'%s' is out of range", arg);
+	return NULL;
+}
 static char *opt_set_u32(const char *arg, u32 *u)
 {
 	char *endp;
 	unsigned long l;
+
+	assert(arg != NULL);
 
 	/* This is how the manpage says to do it.  Yech. */
 	errno = 0;
@@ -86,6 +107,8 @@ static char *opt_set_u16(const char *arg, u16 *u)
 	char *endp;
 	unsigned long l;
 
+	assert(arg != NULL);
+
 	/* This is how the manpage says to do it.  Yech. */
 	errno = 0;
 	l = strtoul(arg, &endp, 0);
@@ -102,6 +125,8 @@ static char *opt_set_s32(const char *arg, s32 *u)
 	char *endp;
 	long l;
 
+	assert(arg != NULL);
+
 	/* This is how the manpage says to do it.  Yech. */
 	errno = 0;
 	l = strtol(arg, &endp, 0);
@@ -116,17 +141,24 @@ static char *opt_set_s32(const char *arg, s32 *u)
 static char *opt_add_ipaddr(const char *arg, struct lightningd *ld)
 {
 	size_t n = tal_count(ld->wireaddrs);
+	char const *err_msg;
+
+	assert(arg != NULL);
 
 	tal_resize(&ld->wireaddrs, n+1);
 
-	if (!parse_wireaddr(arg, &ld->wireaddrs[n], ld->portnum)) {
-		return tal_fmt(NULL, "Unable to parse IP address '%s'", arg);
+	if (!parse_wireaddr(arg, &ld->wireaddrs[n], ld->portnum, &err_msg)) {
+		return tal_fmt(NULL, "Unable to parse IP address '%s': %s", arg, err_msg);
 	}
 
 	return NULL;
 
 }
 
+static void opt_show_u64(char buf[OPT_SHOW_LEN], const u64 *u)
+{
+	snprintf(buf, OPT_SHOW_LEN, "%"PRIu64, *u);
+}
 static void opt_show_u32(char buf[OPT_SHOW_LEN], const u32 *u)
 {
 	snprintf(buf, OPT_SHOW_LEN, "%"PRIu32, *u);
@@ -144,6 +176,8 @@ static void opt_show_u16(char buf[OPT_SHOW_LEN], const u16 *u)
 
 static char *opt_set_network(const char *arg, struct lightningd *ld)
 {
+	assert(arg != NULL);
+
 	ld->topology->bitcoind->chainparams = chainparams_for_network(arg);
 	if (!ld->topology->bitcoind->chainparams)
 		return tal_fmt(NULL, "Unknown network name '%s'", arg);
@@ -158,6 +192,8 @@ static void opt_show_network(char buf[OPT_SHOW_LEN],
 
 static char *opt_set_rgb(const char *arg, struct lightningd *ld)
 {
+	assert(arg != NULL);
+
 	ld->rgb = tal_free(ld->rgb);
 	/* BOLT #7:
 	 *
@@ -171,6 +207,8 @@ static char *opt_set_rgb(const char *arg, struct lightningd *ld)
 
 static char *opt_set_alias(const char *arg, struct lightningd *ld)
 {
+	assert(arg != NULL);
+
 	ld->alias = tal_free(ld->alias);
 	/* BOLT #7:
 	 *
@@ -209,8 +247,17 @@ static char *opt_set_fee_rates(const char *arg, struct chain_topology *topo)
 	return NULL;
 }
 
+static char *opt_set_offline(struct lightningd *ld)
+{
+	ld->portnum = 0;
+	ld->no_reconnect = true;
+	return NULL;
+}
+
 static void config_register_opts(struct lightningd *ld)
 {
+	opt_register_noarg("--daemon", opt_set_bool, &ld->daemon,
+			 "Run in the background, suppress stdout/stderr");
 	opt_register_arg("--ignore-fee-limits", opt_set_bool_arg, opt_show_bool,
 			 &ld->config.ignore_fee_limits,
 			 "(DANGEROUS) allow peer to set any feerate");
@@ -219,7 +266,7 @@ static void config_register_opts(struct lightningd *ld)
 			 "Blocks before peer can unilaterally spend funds");
 	opt_register_arg("--max-locktime-blocks", opt_set_u32, opt_show_u32,
 			 &ld->config.locktime_max,
-			 "Maximum seconds peer can lock up our funds");
+			 "Maximum blocks a peer can lock up our funds");
 	opt_register_arg("--anchor-onchain", opt_set_u32, opt_show_u32,
 			 &ld->config.anchor_onchain_wait,
 			 "Blocks before we give up on pending anchor transaction");
@@ -268,6 +315,8 @@ static void config_register_opts(struct lightningd *ld)
 	opt_register_arg("--ipaddr", opt_add_ipaddr, NULL,
 			 ld,
 			 "Set the IP address (v4 or v6) to announce to the network for incoming connections");
+	opt_register_noarg("--offline", opt_set_offline, ld,
+			   "Start in offline-mode (do not automatically reconnect and do not accept incoming connections");
 
 	opt_register_early_arg("--network", opt_set_network, opt_show_network,
 			       ld,
@@ -277,11 +326,24 @@ static void config_register_opts(struct lightningd *ld)
 			 opt_set_bool_arg, opt_show_bool,
 			 &deprecated_apis,
 			 "Enable deprecated options, JSONRPC commands, fields, etc.");
+	opt_register_arg("--debug-subdaemon-io",
+			 opt_set_charp, NULL, &ld->debug_subdaemon_io,
+			 "Enable full peer IO logging in subdaemons ending in this string (can also send SIGUSR1 to toggle)");
+	opt_register_arg("--autocleaninvoice-cycle",
+			 opt_set_u64, opt_show_u64,
+			 &ld->ini_autocleaninvoice_cycle,
+			 "Perform cleanup of expired invoices every given seconds, or do not autoclean if 0");
+	opt_register_arg("--autocleaninvoice-expired-by",
+			 opt_set_u64, opt_show_u64,
+			 &ld->ini_autocleaninvoice_cycle,
+			 "If expired invoice autoclean enabled, invoices that have expired for at least this given seconds are cleaned");
 }
 
 #if DEVELOPER
 static char *opt_set_hsm_seed(const char *arg, struct lightningd *ld)
 {
+	assert(arg != NULL);
+
 	ld->dev_hsm_seed = tal_hexdata(ld, arg, strlen(arg));
 	if (ld->dev_hsm_seed)
 		return NULL;
@@ -294,8 +356,6 @@ static void dev_register_opts(struct lightningd *ld)
 	opt_register_noarg("--dev-no-reconnect", opt_set_bool,
 			   &ld->no_reconnect,
 			   "Disable automatic reconnect attempts");
-	opt_register_noarg("--dev-no-broadcast", opt_set_bool,
-			   &ld->topology->dev_no_broadcast, opt_hidden);
 	opt_register_noarg("--dev-fail-on-subdaemon-fail", opt_set_bool,
 			   &ld->dev_subdaemon_fail, opt_hidden);
 	opt_register_arg("--dev-debugger=<subdaemon>", opt_subd_debug, NULL,
@@ -443,10 +503,16 @@ static void setup_default_config(struct lightningd *ld)
 		ld->config = testnet_config;
 	else
 		ld->config = mainnet_config;
+
+	/* Set default PID file name to be per-network */
+	tal_free(ld->pidfile);
+	ld->pidfile = tal_fmt(ld, "lightningd-%s.pid", get_chainparams(ld)->network_name);
 }
 
 
 /* FIXME: make this nicer! */
+static int config_parse_line_number = 0;
+
 static void config_log_stderr_exit(const char *fmt, ...)
 {
 	char *msg;
@@ -454,15 +520,19 @@ static void config_log_stderr_exit(const char *fmt, ...)
 
 	va_start(ap, fmt);
 
-	/* This is the format we expect: mangle it to remove '--'. */
+	/* This is the format we expect:*/
 	if (streq(fmt, "%s: %.*s: %s")) {
 		const char *argv0 = va_arg(ap, const char *);
 		unsigned int len = va_arg(ap, unsigned int);
 		const char *arg = va_arg(ap, const char *);
 		const char *problem = va_arg(ap, const char *);
 
-		msg = tal_fmt(NULL, "%s line %s: %.*s: %s",
-			      argv0, arg+strlen(arg)+1, len-2, arg+2, problem);
+		assert(argv0 != NULL);
+		assert(arg != NULL);
+		assert(problem != NULL);
+		/*mangle it to remove '--' and add the line number.*/
+		msg = tal_fmt(NULL, "%s line %d: %.*s: %s",
+			      argv0, config_parse_line_number, len-2, arg+2, problem);
 	} else {
 		msg = tal_vfmt(NULL, fmt, ap);
 	}
@@ -475,7 +545,8 @@ static void config_log_stderr_exit(const char *fmt, ...)
 static void opt_parse_from_config(struct lightningd *ld)
 {
 	char *contents, **lines;
-	char **argv;
+	char **all_args; /*For each line: either argument string or NULL*/
+	char *argv[3];
 	int i, argc;
 
 	contents = grab_file(ld, "config");
@@ -491,26 +562,47 @@ static void opt_parse_from_config(struct lightningd *ld)
 
 	lines = tal_strsplit(contents, contents, "\r\n", STR_NO_EMPTY);
 
-	/* We have to keep argv around, since opt will point into it */
-	argv = tal_arr(ld, char *, argc = 1);
-	argv[0] = "lightning config file";
+	/* We have to keep all_args around, since opt will point into it */
+	all_args = tal_arr(ld, char *, tal_count(lines) - 1);
 
 	for (i = 0; i < tal_count(lines) - 1; i++) {
-		if (strstarts(lines[i], "#"))
-			continue;
-		/* Only valid forms are "foo" and "foo=bar" */
-		tal_resize(&argv, argc+1);
-		/* Stash line number after nul. */
-		argv[argc++] = tal_fmt(argv, "--%s%c%u", lines[i], 0, i+1);
+		if (strstarts(lines[i], "#")) {
+			all_args[i] = NULL;
+		}
+		else {
+			/* Only valid forms are "foo" and "foo=bar" */
+			all_args[i] = tal_fmt(all_args, "--%s", lines[i]);
+		}
 	}
-	tal_resize(&argv, argc+1);
+
+	/*
+	For each line we construct a fake argc,argv commandline.
+	argv[1] is the only element that changes between iterations.
+	*/
+	argc = 2;
+	argv[0] = "lightning config file";
 	argv[argc] = NULL;
 
-	opt_early_parse(argc, argv, config_log_stderr_exit);
+	for (i = 0; i < tal_count(all_args); i++) {
+		if(all_args[i] != NULL) {
+			config_parse_line_number = i + 1;
+			argv[1] = all_args[i];
+			opt_early_parse(argc, argv, config_log_stderr_exit);
+		}
+	}
+
 	/* Now we can set up defaults, depending on whether testnet or not */
 	setup_default_config(ld);
 
-	opt_parse(&argc, argv, config_log_stderr_exit);
+	for (i = 0; i < tal_count(all_args); i++) {
+		if(all_args[i] != NULL) {
+			config_parse_line_number = i + 1;
+			argv[1] = all_args[i];
+			opt_parse(&argc, argv, config_log_stderr_exit);
+			argc = 2; /* opt_parse might have changed it  */
+		}
+	}
+
 	tal_free(contents);
 }
 
@@ -545,6 +637,9 @@ void register_opts(struct lightningd *ld)
 	opt_register_arg("--alias", opt_set_alias, NULL, ld,
 			 "Up to 32-byte alias for node");
 
+	opt_register_arg("--bitcoin-cli", opt_set_talstr, NULL,
+			 &ld->topology->bitcoind->cli,
+			 "bitcoin-cli pathname");
 	opt_register_arg("--bitcoin-rpcuser", opt_set_talstr, NULL,
 			 &ld->topology->bitcoind->rpcuser,
 			 "bitcoind RPC username");
@@ -554,6 +649,12 @@ void register_opts(struct lightningd *ld)
 	opt_register_arg("--bitcoin-rpcconnect", opt_set_talstr, NULL,
 			 &ld->topology->bitcoind->rpcconnect,
 			 "bitcoind RPC host to connect to");
+	opt_register_arg("--bitcoin-rpcport", opt_set_talstr, NULL,
+			 &ld->topology->bitcoind->rpcport,
+			 "bitcoind RPC port");
+	opt_register_arg("--pid-file=<file>", opt_set_talstr, opt_show_charp,
+			 &ld->pidfile,
+			 "Specify pid file");
 
 	opt_register_arg(
 	    "--channel-update-interval=<s>", opt_set_u32, opt_show_u32,
@@ -597,16 +698,30 @@ void setup_color_and_alias(struct lightningd *ld)
 
 	if (!ld->alias) {
 		u64 adjective, noun;
+		char *name;
 
 		memcpy(&adjective, der+3, sizeof(adjective));
 		memcpy(&noun, der+3+sizeof(adjective), sizeof(noun));
 		noun %= ARRAY_SIZE(codename_noun);
 		adjective %= ARRAY_SIZE(codename_adjective);
+
+		/* Only use 32 characters */
+		name = tal_fmt(ld, "%s%s-",
+			       codename_adjective[adjective],
+			       codename_noun[noun]);
+#if DEVELOPER
+		assert(strlen(name) < 32);
+		int taillen = 32 - strlen(name);
+		if (taillen > strlen(version()))
+			taillen = strlen(version());
+		/* Fit as much of end of version() as possible */
+		tal_append_fmt(&name, "%s",
+			       version() + strlen(version()) - taillen);
+#endif
+		assert(strlen(name) <= 32);
 		ld->alias = tal_arrz(ld, u8, 33);
-		assert(strlen(codename_adjective[adjective])
-		       + strlen(codename_noun[noun]) < 33);
-		strcpy((char*)ld->alias, codename_adjective[adjective]);
-		strcat((char*)ld->alias, codename_noun[noun]);
+		strcpy((char*)ld->alias, name);
+		tal_free(name);
 	}
 }
 
@@ -694,6 +809,7 @@ static void add_config(struct lightningd *ld,
 	if (opt->type & OPT_NOARG) {
 		if (opt->cb == (void *)opt_usage_and_exit
 		    || opt->cb == (void *)version_and_exit
+		    || opt->cb == (void *)opt_set_offline /* will show up as port=0 and --no-reconnect */
 		    || opt->cb == (void *)test_daemons_and_exit) {
 			/* These are not important */
 		} else if (opt->cb == (void *)opt_set_bool) {
@@ -761,8 +877,10 @@ static void add_config(struct lightningd *ld,
 		}
 	}
 
-	if (answer)
-		json_add_string_escape(response, name0, answer);
+	if (answer) {
+		struct json_escaped *esc = json_escape(NULL, answer);
+		json_add_escaped_string(response, name0, take(esc));
+	}
 	tal_free(name0);
 }
 
@@ -830,4 +948,3 @@ static const struct json_command listconfigs_command = {
 	"With [config], object only has that field"
 };
 AUTODATA(json_command, &listconfigs_command);
-

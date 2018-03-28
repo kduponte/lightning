@@ -26,13 +26,14 @@ struct utxo {
 	/* Optional unilateral close information, NULL if this is just
 	 * a HD key */
 	struct unilateral_close_info *close_info;
+
+	/* NULL if we haven't seen it in a block, otherwise the block it's in */
+	const u32 *blockheight;
+
+	/* NULL if not spent yet, otherwise, the block the spending transaction is in */
+	const u32 *spendheight;
 };
 
 void towire_utxo(u8 **pptr, const struct utxo *utxo);
-void fromwire_utxo(const tal_t *ctx, const u8 **ptr, size_t *max, struct utxo *utxo);
-
-/* build_utxos/funding_tx use array of pointers, but marshall code
- * wants arr of structs */
-struct utxo *from_utxoptr_arr(const tal_t *ctx, const struct utxo **utxos);
-const struct utxo **to_utxoptr_arr(const tal_t *ctx, const struct utxo *utxos);
+struct utxo *fromwire_utxo(const tal_t *ctx, const u8 **ptr, size_t *max);
 #endif /* LIGHTNING_COMMON_UTXO_H */

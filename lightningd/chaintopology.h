@@ -28,14 +28,14 @@ enum feerate {
 /* Off topology->outgoing_txs */
 struct outgoing_tx {
 	struct list_node list;
-	struct peer *peer;
+	struct channel *channel;
 	const char *hextx;
 	struct bitcoin_txid txid;
-	void (*failed)(struct peer *peer, int exitstatus, const char *err);
+	void (*failed)(struct channel *channel, int exitstatus, const char *err);
 };
 
 struct block {
-	int height;
+	u32 height;
 
 	/* Actual header. */
 	struct bitcoin_block_hdr hdr;
@@ -86,6 +86,9 @@ struct chain_topology {
 	u32 feerate[NUM_FEERATES];
 	bool startup;
 
+	/* Where to store blockchain info. */
+	struct wallet *wallet;
+
 	/* Where to log things. */
 	struct log *log;
 
@@ -113,11 +116,6 @@ struct chain_topology {
 	/* Transactions/txos we are watching. */
 	struct txwatch_hash txwatches;
 	struct txowatch_hash txowatches;
-
-#if DEVELOPER
-	/* Suppress broadcast (for testing) */
-	bool dev_no_broadcast;
-#endif
 };
 
 /* Information relevant to locating a TX in a blockchain. */
@@ -145,15 +143,15 @@ u32 get_feerate(const struct chain_topology *topo, enum feerate feerate);
 /* Broadcast a single tx, and rebroadcast as reqd (copies tx).
  * If failed is non-NULL, call that and don't rebroadcast. */
 void broadcast_tx(struct chain_topology *topo,
-		  struct peer *peer, const struct bitcoin_tx *tx,
-		  void (*failed)(struct peer *peer,
+		  struct channel *channel, const struct bitcoin_tx *tx,
+		  void (*failed)(struct channel *channel,
 				 int exitstatus,
 				 const char *err));
 
 struct chain_topology *new_topology(struct lightningd *ld, struct log *log);
 void setup_topology(struct chain_topology *topology,
 		    struct timers *timers,
-		    struct timerel poll_time, u32 first_peer_block);
+		    struct timerel poll_time, u32 first_channel_block);
 
 void begin_topology(struct chain_topology *topo);
 
@@ -163,10 +161,6 @@ void notify_new_block(struct lightningd *ld, unsigned int height);
 void notify_feerate_change(struct lightningd *ld);
 
 #if DEVELOPER
-void json_dev_broadcast(struct command *cmd,
-			struct chain_topology *topo,
-			const char *buffer, const jsmntok_t *params);
-
 void chaintopology_mark_pointers_used(struct htable *memtable,
 				      const struct chain_topology *topo);
 #endif

@@ -41,11 +41,6 @@ static void tal_freefn(void *ptr)
 }
 
 struct netaddr;
-char *netaddr_name(const tal_t *ctx, const struct netaddr *a);
-char *netaddr_name(const tal_t *ctx, const struct netaddr *a)
-{
-	return NULL;
-}
 
 /* Returns number of tokens digested */
 static size_t human_readable(const char *buffer, const jsmntok_t *t, char term)
@@ -87,8 +82,26 @@ static size_t human_readable(const char *buffer, const jsmntok_t *t, char term)
 			n += human_readable(buffer, t + n, '\n');
 		}
 		return n;
+	case JSMN_UNDEFINED:
+		break;
 	}
 	abort();
+}
+
+static void human_help(const char *buffer, const jsmntok_t *result) {
+	int i;
+	const jsmntok_t * help_array = result + 2;
+	/* the first command object */
+	const jsmntok_t * curr = help_array + 1;
+	/* iterate through all commands, printing the name and description */
+	for (i = 0; i<help_array->size; i++) {
+		curr += 2;
+		printf("%.*s\n", curr->end - curr->start, buffer + curr->start);
+		curr += 2;
+		printf("    %.*s\n\n", curr->end - curr->start, buffer + curr->start);
+		/* advance to next command */
+		curr++;
+	}
 }
 
 enum format {
@@ -129,13 +142,14 @@ static char *opt_set_ordered(enum input *input)
 
 static bool is_literal(const char *arg)
 {
-	return strspn(arg, "0123456789") == strlen(arg)
+	size_t arglen = strlen(arg);
+	return strspn(arg, "0123456789") == arglen
 		|| streq(arg, "true")
 		|| streq(arg, "false")
 		|| streq(arg, "null")
-		|| arg[0] == '{'
-		|| arg[0] == '['
-		|| arg[0] == '"';
+		|| (arg[0] == '{' && arg[arglen - 1] == '}')
+		|| (arg[0] == '[' && arg[arglen - 1] == ']')
+		|| (arg[0] == '"' && arg[arglen - 1] == '"');
 }
 
 static void add_input(char **cmd, const char *input,
@@ -162,7 +176,7 @@ int main(int argc, char *argv[])
 	char *lightning_dir;
 	const tal_t *ctx = tal(NULL, char);
 	jsmn_parser parser;
-	jsmnerr_t parserr;
+	int parserr;
 	enum format format = DEFAULT_FORMAT;
 	enum input input = DEFAULT_INPUT;
 
@@ -312,7 +326,8 @@ int main(int argc, char *argv[])
 
 	if (!error || json_tok_is_null(resp, error)) {
 		if (format == HUMAN)
-			human_readable(resp, result, '\n');
+			if (streq(method, "help")) human_help(resp, result);
+			else human_readable(resp, result, '\n');
 		else
 			printf("%.*s\n",
 			       json_tok_len(result),

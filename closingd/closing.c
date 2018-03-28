@@ -1,3 +1,4 @@
+/* FIXME: We don't relay from gossipd at all here. */
 #include <bitcoin/script.h>
 #include <ccan/structeq/structeq.h>
 #include <closingd/gen_closing_wire.h>
@@ -5,6 +6,7 @@
 #include <common/crypto_sync.h>
 #include <common/derive_basepoints.h>
 #include <common/htlc.h>
+#include <common/peer_billboard.h>
 #include <common/peer_failed.h>
 #include <common/read_peer_msg.h>
 #include <common/status.h>
@@ -27,6 +29,7 @@
 
 static struct bitcoin_tx *close_tx(const tal_t *ctx,
 				   struct crypto_state *cs,
+				   u64 gossip_index,
 				   const struct channel_id *channel_id,
 				   u8 *scriptpubkey[NUM_SIDES],
 				   const struct bitcoin_txid *funding_txid,
@@ -40,7 +43,7 @@ static struct bitcoin_tx *close_tx(const tal_t *ctx,
 	struct bitcoin_tx *tx;
 
 	if (satoshi_out[funder] < fee)
-		peer_failed(PEER_FD, cs, channel_id,
+		peer_failed(cs, gossip_index, channel_id,
 			      "Funder cannot afford fee %"PRIu64
 			      " (%"PRIu64" and %"PRIu64")",
 			      fee, satoshi_out[LOCAL],
@@ -59,7 +62,7 @@ static struct bitcoin_tx *close_tx(const tal_t *ctx,
 			     satoshi_out[REMOTE] - (funder == REMOTE ? fee : 0),
 			     dust_limit);
 	if (!tx)
-		peer_failed(PEER_FD, cs, channel_id,
+		peer_failed(cs, gossip_index, channel_id,
 			    "Both outputs below dust limit:"
 			    " funding = %"PRIu64
 			    " fee = %"PRIu64
@@ -74,30 +77,14 @@ static struct bitcoin_tx *close_tx(const tal_t *ctx,
 	return tx;
 }
 
-/* Handle random messages we might get, returning the first non-handled one. */
-static u8 *closing_read_peer_msg(const tal_t *ctx,
-				 struct crypto_state *cs,
-				 const struct channel_id *channel)
-{
-	u8 *msg;
-
-	while ((msg = read_peer_msg(ctx, cs, channel,
-				    sync_crypto_write_arg,
-				    status_fail_io,
-				    status_fail_errpkt,
-				    NULL)) == NULL);
-
-	return msg;
-}
-
 static void do_reconnect(struct crypto_state *cs,
+			 u64 gossip_index,
 			 const struct channel_id *channel_id,
 			 const u64 next_index[NUM_SIDES],
 			 u64 revocations_received)
 {
 	u8 *msg;
 	struct channel_id their_channel_id;
-	const tal_t *tmpctx = tal_tmpctx(NULL);
 	u64 next_local_commitment_number, next_remote_revocation_number;
 
 	/* BOLT #2:
@@ -111,20 +98,23 @@ static void do_reconnect(struct crypto_state *cs,
 	 * `next_remote_revocation_number` to the commitment number of the
 	 * next `revoke_and_ack` message it expects to receive.
 	 */
-	msg = towire_channel_reestablish(tmpctx, channel_id,
+	msg = towire_channel_reestablish(NULL, channel_id,
 					 next_index[LOCAL],
 					 revocations_received);
 	if (!sync_crypto_write(cs, PEER_FD, take(msg)))
-		status_failed(STATUS_FAIL_PEER_IO,
-			      "Failed writing reestablish: %s", strerror(errno));
+		peer_failed_connection_lost();
 
 	/* Wait for them to say something interesting */
-	msg = closing_read_peer_msg(tmpctx, cs, channel_id);
+	while ((msg = read_peer_msg(tmpctx, cs, gossip_index, channel_id,
+				    sync_crypto_write_arg,
+				    status_fail_io,
+				    NULL)) == NULL)
+		clean_tmpctx();
 
-	if (!fromwire_channel_reestablish(msg, NULL, &their_channel_id,
+	if (!fromwire_channel_reestablish(msg, &their_channel_id,
 					  &next_local_commitment_number,
 					  &next_remote_revocation_number)) {
-		peer_failed(PEER_FD, cs, channel_id,
+		peer_failed(cs, gossip_index, channel_id,
 			    "bad reestablish msg: %s %s",
 			    wire_type_name(fromwire_peektype(msg)),
 			    tal_hex(tmpctx, msg));
@@ -145,10 +135,10 @@ static void do_reconnect(struct crypto_state *cs,
 	/* Since we always transmit closing_signed immediately, if
 	 * we're reconnecting we consider ourselves to have transmitted once,
 	 * and we'll immediately do the retransmit now anyway. */
-	tal_free(tmpctx);
 }
 
 static void send_offer(struct crypto_state *cs,
+		       u64 gossip_index,
 		       const struct channel_id *channel_id,
 		       const struct pubkey funding_pubkey[NUM_SIDES],
 		       const u8 *funding_wscript,
@@ -162,7 +152,6 @@ static void send_offer(struct crypto_state *cs,
 		       const struct secrets *secrets,
 		       uint64_t fee_to_offer)
 {
-	const tal_t *tmpctx = tal_tmpctx(NULL);
 	struct bitcoin_tx *tx;
 	secp256k1_ecdsa_signature our_sig;
 	u8 *msg;
@@ -173,7 +162,7 @@ static void send_offer(struct crypto_state *cs,
 	 * the close transaction as specified in [BOLT
 	 * #3](03-transactions.md#closing-transaction).
 	 */
-	tx = close_tx(tmpctx, cs, channel_id,
+	tx = close_tx(tmpctx, cs, gossip_index, channel_id,
 		      scriptpubkey,
 		      funding_txid,
 		      funding_txout,
@@ -196,16 +185,12 @@ static void send_offer(struct crypto_state *cs,
 
 	status_trace("sending fee offer %"PRIu64, fee_to_offer);
 
-	msg = towire_closing_signed(tmpctx, channel_id, fee_to_offer, &our_sig);
+	msg = towire_closing_signed(NULL, channel_id, fee_to_offer, &our_sig);
 	if (!sync_crypto_write(cs, PEER_FD, take(msg)))
-		status_failed(STATUS_FAIL_PEER_IO,
-			      "Writing closing_signed");
-
-	tal_free(tmpctx);
+		peer_failed_connection_lost();
 }
 
-static void tell_master_their_offer(u64 their_offer,
-				    const secp256k1_ecdsa_signature *their_sig,
+static void tell_master_their_offer(const secp256k1_ecdsa_signature *their_sig,
 				    const struct bitcoin_tx *tx)
 {
 	u8 *msg = towire_closing_received_signature(NULL, their_sig, tx);
@@ -216,13 +201,14 @@ static void tell_master_their_offer(u64 their_offer,
 
 	/* Wait for master to ack, to make sure it's in db. */
 	msg = wire_sync_read(NULL, REQ_FD);
-	if (!fromwire_closing_received_signature_reply(msg,NULL))
+	if (!fromwire_closing_received_signature_reply(msg))
 		master_badmsg(WIRE_CLOSING_RECEIVED_SIGNATURE_REPLY, msg);
 	tal_free(msg);
 }
 
 /* Returns fee they offered. */
 static uint64_t receive_offer(struct crypto_state *cs,
+			      u64 gossip_index,
 			      const struct channel_id *channel_id,
 			      const struct pubkey funding_pubkey[NUM_SIDES],
 			      const u8 *funding_wscript,
@@ -235,7 +221,6 @@ static uint64_t receive_offer(struct crypto_state *cs,
 			      uint64_t our_dust_limit,
 			      u64 min_fee_to_accept)
 {
-	const tal_t *tmpctx = tal_tmpctx(NULL);
 	u8 *msg;
 	struct channel_id their_channel_id;
 	u64 received_fee;
@@ -244,7 +229,12 @@ static uint64_t receive_offer(struct crypto_state *cs,
 
 	/* Wait for them to say something interesting */
 	do {
-		msg = closing_read_peer_msg(tmpctx, cs, channel_id);
+		clean_tmpctx();
+
+		msg = read_peer_msg(tmpctx, cs, gossip_index, channel_id,
+				    sync_crypto_write_arg,
+				    status_fail_io,
+				    NULL);
 
 		/* BOLT #2:
 		 *
@@ -253,22 +243,22 @@ static uint64_t receive_offer(struct crypto_state *cs,
 		 */
 		/* This should only happen if we've made no commitments, but
 		 * we don't have to check that: it's their problem. */
-		if (fromwire_peektype(msg) == WIRE_FUNDING_LOCKED)
+		if (msg && fromwire_peektype(msg) == WIRE_FUNDING_LOCKED)
 			msg = tal_free(msg);
 		/* BOLT #2:
 		 *
 		 * ...if the node has sent a previous `shutdown` it MUST
 		 * retransmit it.
 		 */
-		else if (fromwire_peektype(msg) == WIRE_SHUTDOWN)
+		else if (msg && fromwire_peektype(msg) == WIRE_SHUTDOWN)
 			msg = tal_free(msg);
 	} while (!msg);
 
-	if (!fromwire_closing_signed(msg, NULL, &their_channel_id,
+	if (!fromwire_closing_signed(msg, &their_channel_id,
 				     &received_fee, &their_sig))
-		peer_failed(PEER_FD, cs, channel_id,
+		peer_failed(cs, gossip_index, channel_id,
 			    "Expected closing_signed: %s",
-			    tal_hex(trc, msg));
+			    tal_hex(tmpctx, msg));
 
 	/* BOLT #2:
 	 *
@@ -277,7 +267,7 @@ static uint64_t receive_offer(struct crypto_state *cs,
 	 * #3](03-transactions.md#closing-transaction), and MUST fail
 	 * the connection if it is not.
 	 */
-	tx = close_tx(tmpctx, cs, channel_id,
+	tx = close_tx(tmpctx, cs, gossip_index, channel_id,
 		      scriptpubkey,
 		      funding_txid,
 		      funding_txout,
@@ -303,7 +293,7 @@ static uint64_t receive_offer(struct crypto_state *cs,
 		 * then remove any output below its own `dust_limit_satoshis`,
 		 * and MAY also eliminate its own output.
 		 */
-		trimmed = close_tx(tmpctx, cs, channel_id,
+		trimmed = close_tx(tmpctx, cs, gossip_index, channel_id,
 				   scriptpubkey,
 				   funding_txid,
 				   funding_txout,
@@ -313,7 +303,7 @@ static uint64_t receive_offer(struct crypto_state *cs,
 		if (!trimmed
 		    || !check_tx_sig(trimmed, 0, NULL, funding_wscript,
 				     &funding_pubkey[REMOTE], &their_sig)) {
-			peer_failed(PEER_FD, cs, channel_id,
+			peer_failed(cs, gossip_index, channel_id,
 				    "Bad closing_signed signature for"
 				    " %s (and trimmed version %s)",
 				    type_to_string(tmpctx,
@@ -333,10 +323,9 @@ static uint64_t receive_offer(struct crypto_state *cs,
 	/* Master sorts out what is best offer, we just tell it any above min */
 	if (received_fee >= min_fee_to_accept) {
 		status_trace("...offer is reasonable");
-		tell_master_their_offer(received_fee, &their_sig, tx);
+		tell_master_their_offer(&their_sig, tx);
 	}
 
-	tal_free(tmpctx);
 	return received_fee;
 }
 
@@ -349,8 +338,7 @@ struct feerange {
 
 static void init_feerange(struct feerange *feerange,
 			  u64 commitment_fee,
-			  const u64 offer[NUM_SIDES],
-			  bool allow_mistakes)
+			  const u64 offer[NUM_SIDES])
 {
 	feerange->min = 0;
 
@@ -373,13 +361,14 @@ static void init_feerange(struct feerange *feerange,
 }
 
 static void adjust_feerange(struct crypto_state *cs,
+			    u64 gossip_index,
 			    const struct channel_id *channel_id,
 			    struct feerange *feerange,
 			    u64 offer, enum side side)
 {
 	if (offer < feerange->min || offer > feerange->max) {
 		if (!feerange->allow_mistakes || side != REMOTE)
-			peer_failed(PEER_FD, cs, channel_id,
+			peer_failed(cs, gossip_index, channel_id,
 				    "%s offer %"PRIu64
 				    " not between %"PRIu64" and %"PRIu64,
 				    side == LOCAL ? "local" : "remote",
@@ -406,6 +395,7 @@ static void adjust_feerange(struct crypto_state *cs,
 
 /* Figure out what we should offer now. */
 static u64 adjust_offer(struct crypto_state *cs,
+			u64 gossip_index,
 			const struct channel_id *channel_id,
 			const struct feerange *feerange,
 			u64 remote_offer,
@@ -417,7 +407,7 @@ static u64 adjust_offer(struct crypto_state *cs,
 
 	/* Max is below our minimum acceptable? */
 	if (feerange->max < min_fee_to_accept)
-		peer_failed(PEER_FD, cs, channel_id,
+		peer_failed(cs, gossip_index, channel_id,
 			    "Feerange %"PRIu64"-%"PRIu64
 			    " below minimum acceptable %"PRIu64,
 			    feerange->min, feerange->max,
@@ -433,7 +423,7 @@ static u64 adjust_offer(struct crypto_state *cs,
 int main(int argc, char *argv[])
 {
 	struct crypto_state cs;
-	const tal_t *ctx = tal_tmpctx(NULL);
+	const tal_t *ctx = tal(NULL, char);
 	u8 *msg;
 	struct privkey seed;
 	struct pubkey funding_pubkey[NUM_SIDES];
@@ -457,8 +447,8 @@ int main(int argc, char *argv[])
 
 	status_setup_sync(REQ_FD);
 
-	msg = wire_sync_read(ctx, REQ_FD);
-	if (!fromwire_closing_init(ctx, msg, NULL,
+	msg = wire_sync_read(tmpctx, REQ_FD);
+	if (!fromwire_closing_init(ctx, msg,
 				   &cs, &gossip_index, &seed,
 				   &funding_txid, &funding_txout,
 				   &funding_satoshi,
@@ -491,7 +481,12 @@ int main(int argc, char *argv[])
 					      &funding_pubkey[REMOTE]);
 
 	if (reconnected)
-		do_reconnect(&cs, &channel_id, next_index, revocations_received);
+		do_reconnect(&cs, gossip_index, &channel_id,
+			     next_index, revocations_received);
+
+	peer_billboard(true, "Negotiating closing fee between %"PRIu64
+		       " and %"PRIu64" satoshi (ideal %"PRIu64")",
+		       min_fee_to_accept, commitment_fee, offer[LOCAL]);
 
 	/* BOLT #2:
 	 *
@@ -503,14 +498,24 @@ int main(int argc, char *argv[])
 	whose_turn = funder;
 	for (size_t i = 0; i < 2; i++, whose_turn = !whose_turn) {
 		if (whose_turn == LOCAL) {
-			send_offer(&cs, &channel_id, funding_pubkey,
+			send_offer(&cs, gossip_index,
+				   &channel_id, funding_pubkey,
 				   funding_wscript,
 				   scriptpubkey, &funding_txid, funding_txout,
 				   funding_satoshi, satoshi_out, funder,
 				   our_dust_limit, &secrets, offer[LOCAL]);
 		} else {
+			if (i == 0)
+				peer_billboard(false, "Waiting for their initial"
+					       " closing fee offer");
+			else
+				peer_billboard(false, "Waiting for their initial"
+					       " closing fee offer:"
+					       " ours was %"PRIu64" satoshi",
+					       offer[LOCAL]);
 			offer[REMOTE]
-				= receive_offer(&cs, &channel_id, funding_pubkey,
+				= receive_offer(&cs, gossip_index,
+						&channel_id, funding_pubkey,
 						funding_wscript,
 						scriptpubkey, &funding_txid,
 						funding_txout, funding_satoshi,
@@ -521,33 +526,41 @@ int main(int argc, char *argv[])
 	}
 
 	/* Now we have first two points, we can init fee range. */
-	init_feerange(&feerange, commitment_fee, offer, deprecated_api);
+	init_feerange(&feerange, commitment_fee, offer);
 
 	/* Now apply the one constraint from above (other is inside loop). */
-	adjust_feerange(&cs, &channel_id, &feerange,
+	adjust_feerange(&cs, gossip_index, &channel_id, &feerange,
 			offer[!whose_turn], !whose_turn);
 
 	/* Now any extra rounds required. */
 	while (offer[LOCAL] != offer[REMOTE]) {
 		/* If they differ, adjust feerate. */
-		adjust_feerange(&cs, &channel_id, &feerange,
+		adjust_feerange(&cs, gossip_index, &channel_id, &feerange,
 				offer[whose_turn], whose_turn);
 
 		/* Now its the other side's turn. */
 		whose_turn = !whose_turn;
 
 		if (whose_turn == LOCAL) {
-			offer[LOCAL] = adjust_offer(&cs, &channel_id,
+			offer[LOCAL] = adjust_offer(&cs, gossip_index,
+						    &channel_id,
 						    &feerange, offer[REMOTE],
 						    min_fee_to_accept);
-			send_offer(&cs, &channel_id, funding_pubkey,
+			send_offer(&cs, gossip_index, &channel_id,
+				   funding_pubkey,
 				   funding_wscript,
 				   scriptpubkey, &funding_txid, funding_txout,
 				   funding_satoshi, satoshi_out, funder,
 				   our_dust_limit, &secrets, offer[LOCAL]);
 		} else {
+			peer_billboard(false, "Waiting for another"
+				       " closing fee offer:"
+				       " ours was %"PRIu64" satoshi,"
+				       " theirs was %"PRIu64" satoshi,",
+				       offer[LOCAL], offer[REMOTE]);
 			offer[REMOTE]
-				= receive_offer(&cs, &channel_id, funding_pubkey,
+				= receive_offer(&cs, gossip_index, &channel_id,
+						funding_pubkey,
 						funding_wscript,
 						scriptpubkey, &funding_txid,
 						funding_txout, funding_satoshi,
@@ -557,10 +570,14 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	peer_billboard(true, "We agreed on a closing fee of %"PRIu64" satoshi",
+		       offer[LOCAL]);
+
 	/* We're done! */
 	wire_sync_write(REQ_FD,
-			take(towire_closing_complete(ctx, gossip_index)));
+			take(towire_closing_complete(NULL, gossip_index)));
 	tal_free(ctx);
+	tal_free(tmpctx);
 
 	return 0;
 }

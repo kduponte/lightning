@@ -32,7 +32,21 @@ ifeq ($(COVERAGE),1)
 COVFLAGS = --coverage
 endif
 
+ifeq ($(PIE),1)
+PIE_CFLAGS=-fPIE -fPIC
+PIE_LDFLAGS=-pie
+endif
+
+ifneq ($(NO_COMPAT),1)
+# We support compatibility with pre-0.6.
+COMPAT_CFLAGS=-DCOMPAT_V052=1
+endif
+
 PYTEST := $(shell command -v pytest 2> /dev/null)
+PYTEST_OPTS := -v -x
+ifeq ($(TRAVIS),true)
+PYTEST_OPTS += --reruns=3
+endif
 
 # This is where we add new features as bitcoin adds them.
 FEATURES :=
@@ -47,6 +61,7 @@ CCAN_OBJS :=					\
 	ccan-crypto-sha256.o			\
 	ccan-crypto-shachain.o			\
 	ccan-crypto-siphash24.o			\
+	ccan-daemonize.o			\
 	ccan-err.o				\
 	ccan-fdpass.o				\
 	ccan-htable.o				\
@@ -71,6 +86,7 @@ CCAN_OBJS :=					\
 	ccan-str.o				\
 	ccan-take.o				\
 	ccan-tal-grab_file.o			\
+	ccan-tal-link.o				\
 	ccan-tal-path.o				\
 	ccan-tal-str.o				\
 	ccan-tal.o				\
@@ -97,6 +113,7 @@ CCAN_HEADERS :=						\
 	$(CCANDIR)/ccan/crypto/sha256/sha256.h		\
 	$(CCANDIR)/ccan/crypto/shachain/shachain.h	\
 	$(CCANDIR)/ccan/crypto/siphash24/siphash24.h	\
+	$(CCANDIR)/ccan/daemonize/daemonize.h		\
 	$(CCANDIR)/ccan/endian/endian.h			\
 	$(CCANDIR)/ccan/err/err.h			\
 	$(CCANDIR)/ccan/fdpass/fdpass.h			\
@@ -129,6 +146,7 @@ CCAN_HEADERS :=						\
 	$(CCANDIR)/ccan/structeq/structeq.h		\
 	$(CCANDIR)/ccan/take/take.h			\
 	$(CCANDIR)/ccan/tal/grab_file/grab_file.h	\
+	$(CCANDIR)/ccan/tal/link/link.h			\
 	$(CCANDIR)/ccan/tal/path/path.h			\
 	$(CCANDIR)/ccan/tal/str/str.h			\
 	$(CCANDIR)/ccan/tal/tal.h			\
@@ -148,10 +166,13 @@ ALL_PROGRAMS =
 CPPFLAGS = -DBINTOPKGLIBEXECDIR='"'$(shell sh tools/rel.sh $(bindir) $(pkglibexecdir))'"'
 CWARNFLAGS := -Werror -Wall -Wundef -Wmissing-prototypes -Wmissing-declarations -Wstrict-prototypes -Wold-style-definition
 CDEBUGFLAGS := -std=gnu11 -g -fstack-protector
-CFLAGS = $(CPPFLAGS) $(CWARNFLAGS) $(CDEBUGFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLUDE_FLAGS) -I . -I/usr/local/include $(FEATURES) $(COVFLAGS) $(DEV_CFLAGS) -DSHACHAIN_BITS=48 -DJSMN_PARENT_LINKS
+CFLAGS = $(CPPFLAGS) $(CWARNFLAGS) $(CDEBUGFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLUDE_FLAGS) -I . -I/usr/local/include $(FEATURES) $(COVFLAGS) $(DEV_CFLAGS) -DSHACHAIN_BITS=48 -DJSMN_PARENT_LINKS $(PIE_CFLAGS) $(COMPAT_CFLAGS)
 
-LDFLAGS = -L/usr/local/lib
-LDLIBS = -lm -lgmp -lsqlite3 $(COVFLAGS)
+# We can get configurator to run a different compile cmd to cross-configure.
+CONFIGURATOR_CC := $(CC)
+
+LDFLAGS = $(PIE_LDFLAGS)
+LDLIBS = -L/usr/local/lib -lm -lgmp -lsqlite3 $(COVFLAGS)
 
 default: all-programs all-test-programs
 
@@ -168,7 +189,6 @@ include closingd/Makefile
 include onchaind/Makefile
 include lightningd/Makefile
 include cli/Makefile
-include test/Makefile
 include doc/Makefile
 include devtools/Makefile
 
@@ -188,7 +208,7 @@ pytest: $(ALL_PROGRAMS)
 ifndef PYTEST
 	PYTHONPATH=contrib/pylightning:$$PYTHONPATH DEVELOPER=$(DEVELOPER) python3 tests/test_lightningd.py -f
 else
-	PYTHONPATH=contrib/pylightning:$$PYTHONPATH TEST_DEBUG=1 DEVELOPER=$(DEVELOPER) $(PYTEST) -vx tests/test_lightningd.py --test-group=$(TEST_GROUP) --test-group-count=$(TEST_GROUP_COUNT)
+	PYTHONPATH=contrib/pylightning:$$PYTHONPATH TEST_DEBUG=1 DEVELOPER=$(DEVELOPER) $(PYTEST) -vx tests/test_lightningd.py --test-group=$(TEST_GROUP) --test-group-count=$(TEST_GROUP_COUNT) $(PYTEST_OPTS)
 endif
 
 # Keep includes in alpha order.
@@ -228,7 +248,17 @@ check-markdown:
 check-spelling:
 	@tools/check-spelling.sh
 
-check-source: check-makefile check-source-bolt check-whitespace check-markdown check-spelling
+PYSRC=$(shell git ls-files "*.py") contrib/pylightning/lightning-pay
+
+check-python:
+	@# E501 line too long (N > 79 characters)
+	@# E731 do not assign a lambda expression, use a def
+	@flake8 --ignore=E501,E731 --exclude=contrib/pylightning/lightning/__init__.py ${PYSRC}
+
+check-includes:
+	@tools/check-includes.sh
+
+check-source: check-makefile check-source-bolt check-whitespace check-markdown check-spelling check-python check-includes
 
 full-check: check check-source
 
@@ -250,8 +280,8 @@ ALL_PROGRAMS += ccan/ccan/cdump/tools/cdump-enumstr
 # Can't add to ALL_OBJS, as that makes a circular dep.
 ccan/ccan/cdump/tools/cdump-enumstr.o: $(CCAN_HEADERS) Makefile
 
-ccan/config.h: ccan/tools/configurator/configurator
-	if $< > $@.new; then mv $@.new $@; else rm $@.new; exit 1; fi
+ccan/config.h: ccan/tools/configurator/configurator Makefile
+	if $< --configurator-cc="$(CONFIGURATOR_CC)" $(CC) $(CFLAGS) > $@.new; then mv $@.new $@; else rm $@.new; exit 1; fi
 
 gen_version.h: FORCE
 	@(echo "#define VERSION \"`git describe --always --dirty`\"" && echo "#define VERSION_NAME \"$(NAME)\"" && echo "#define BUILD_FEATURES \"$(FEATURES)\"") > $@.new
@@ -406,9 +436,9 @@ uninstall:
 
 installcheck:
 	@rm -rf testinstall || true
-	$(MAKE) DESTDIR=testinstall install
+	$(MAKE) DESTDIR=$$(pwd)/testinstall install
 	testinstall$(bindir)/lightningd --test-daemons-only --lightning-dir=testinstall
-	$(MAKE) DESTDIR=testinstall uninstall
+	$(MAKE) DESTDIR=$$(pwd)/testinstall uninstall
 	@if test `find testinstall '!' -type d | wc -l` -ne 0; then \
 		echo 'make uninstall left some files in testinstall directory!'; \
 		exit 1; \
@@ -423,6 +453,8 @@ ccan-breakpoint.o: $(CCANDIR)/ccan/breakpoint/breakpoint.c
 ccan-tal.o: $(CCANDIR)/ccan/tal/tal.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-tal-str.o: $(CCANDIR)/ccan/tal/str/str.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+ccan-tal-link.o: $(CCANDIR)/ccan/tal/link/link.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-tal-path.o: $(CCANDIR)/ccan/tal/path/path.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -449,6 +481,8 @@ ccan-opt-helpers.o: $(CCANDIR)/ccan/opt/helpers.c
 ccan-opt-parse.o: $(CCANDIR)/ccan/opt/parse.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-opt-usage.o: $(CCANDIR)/ccan/opt/usage.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+ccan-daemonize.o: $(CCANDIR)/ccan/daemonize/daemonize.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-err.o: $(CCANDIR)/ccan/err/err.c
 	$(CC) $(CFLAGS) -c -o $@ $<

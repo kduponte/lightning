@@ -16,7 +16,6 @@ struct block;
 struct lightningd;
 struct ripemd160;
 struct bitcoin_tx;
-struct peer;
 struct bitcoin_block;
 
 enum bitcoind_mode {
@@ -26,6 +25,9 @@ enum bitcoind_mode {
 };
 
 struct bitcoind {
+	/* eg. "bitcoin-cli" */
+	char *cli;
+
 	/* -datadir arg for bitcoin-cli. */
 	char *datadir;
 
@@ -52,7 +54,7 @@ struct bitcoind {
 	bool shutdown;
 
 	/* Passthrough parameters for bitcoin-cli */
-	char *rpcuser, *rpcpass, *rpcconnect;
+	char *rpcuser, *rpcpass, *rpcconnect, *rpcport;
 };
 
 struct bitcoind *new_bitcoind(const tal_t *ctx,

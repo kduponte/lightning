@@ -66,12 +66,16 @@ static const struct json_command dev_memdump_command = {
 };
 AUTODATA(json_command, &dev_memdump_command);
 
-static int json_add_syminfo(void *data, uintptr_t pc,
+static int json_add_syminfo(void *data, uintptr_t pc UNUSED,
 			    const char *filename, int lineno,
 			    const char *function)
 {
 	struct json_result *response = data;
 	char *str;
+
+	/* This can happen in backtraces. */
+	if (!filename || !function)
+		return 0;
 
 	str = tal_fmt(response, "%s:%u (%s)", filename, lineno, function);
 	json_add_string(response, NULL, str);

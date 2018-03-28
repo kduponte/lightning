@@ -1,14 +1,13 @@
-#ifndef WALLET_DB_H
-#define WALLET_DB_H
-
+#ifndef LIGHTNING_WALLET_DB_H
+#define LIGHTNING_WALLET_DB_H
 #include "config.h"
-#include <bitcoin/pubkey.h>
+
 #include <bitcoin/preimage.h>
+#include <bitcoin/pubkey.h>
 #include <bitcoin/short_channel_id.h>
 #include <bitcoin/tx.h>
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
-
 #include <secp256k1_ecdh.h>
 #include <sqlite3.h>
 #include <stdbool.h>
@@ -113,6 +112,17 @@ bool db_exec_prepared_mayfail_(const char *caller,
 			       struct db *db,
 			       sqlite3_stmt *stmt);
 
+/* Do not keep db open across a fork: needed for --daemon */
+void db_close_for_fork(struct db *db);
+void db_reopen_after_fork(struct db *db);
+
+#define sqlite3_column_arr(ctx, stmt, col, type)			\
+	((type *)sqlite3_column_arr_((ctx), (stmt), (col),		\
+				     sizeof(type), TAL_LABEL(type, "[]"), \
+				     __func__))
+void *sqlite3_column_arr_(const tal_t *ctx, sqlite3_stmt *stmt, int col,
+			  size_t bytes, const char *label, const char *caller);
+
 bool sqlite3_bind_short_channel_id(sqlite3_stmt *stmt, int col,
 				   const struct short_channel_id *id);
 bool sqlite3_column_short_channel_id(sqlite3_stmt *stmt, int col,
@@ -146,4 +156,9 @@ bool sqlite3_column_sha256_double(sqlite3_stmt *stmt, int col,  struct sha256_do
 bool sqlite3_bind_sha256_double(sqlite3_stmt *stmt, int col, const struct sha256_double *p);
 struct secret *sqlite3_column_secrets(const tal_t *ctx,
 				      sqlite3_stmt *stmt, int col);
-#endif /* WALLET_DB_H */
+
+struct json_escaped *sqlite3_column_json_escaped(const tal_t *ctx,
+						 sqlite3_stmt *stmt, int col);
+bool sqlite3_bind_json_escaped(sqlite3_stmt *stmt, int col,
+			       const struct json_escaped *esc);
+#endif /* LIGHTNING_WALLET_DB_H */

@@ -1,7 +1,8 @@
 #include "db.h"
 
 #include <ccan/tal/str/str.h>
-#include <ccan/tal/tal.h>
+#include <common/json_escaped.h>
+#include <common/version.h>
 #include <inttypes.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
@@ -189,6 +190,86 @@ char *dbmigrations[] = {
      * concerns. */
     "ALTER TABLE payments ADD COLUMN route_nodes BLOB;",
     "ALTER TABLE payments ADD COLUMN route_channels TEXT;",
+    "CREATE TABLE htlc_sigs (channelid INTEGER REFERENCES channels(id) ON DELETE CASCADE, signature BLOB);",
+    "CREATE INDEX channel_idx ON htlc_sigs (channelid)",
+    /* Get rid of OPENINGD entries; we don't put them in db any more */
+    "DELETE FROM channels WHERE state=1",
+    /* Keep track of db upgrades, for debugging */
+    "CREATE TABLE db_upgrades (upgrade_from INTEGER, lightning_version TEXT);",
+    /* We used not to clean up peers when their channels were gone. */
+    "DELETE FROM peers WHERE id NOT IN (SELECT peer_id FROM channels);",
+    /* The ONCHAIND_CHEATED/THEIR_UNILATERAL/OUR_UNILATERAL/MUTUAL are now one */
+    "UPDATE channels SET STATE = 8 WHERE state > 8;",
+    /* Add bolt11 to invoices table*/
+    "ALTER TABLE invoices ADD bolt11 TEXT;",
+    /* What do we think the head of the blockchain looks like? Used
+     * primarily to track confirmations across restarts and making
+     * sure we handle reorgs correctly. */
+    "CREATE TABLE blocks (height INT, hash BLOB, prev_hash BLOB, UNIQUE(height));",
+    /* ON DELETE CASCADE would have been nice for confirmation_height,
+     * so that we automatically delete outputs that fall off the
+     * blockchain and then we rediscover them if they are included
+     * again. However, we have the their_unilateral/to_us which we
+     * can't simply recognize from the chain without additional
+     * hints. So we just mark them as unconfirmed should the block
+     * die. */
+    "ALTER TABLE outputs ADD COLUMN confirmation_height INTEGER REFERENCES blocks(height) ON DELETE SET NULL;",
+    "ALTER TABLE outputs ADD COLUMN spend_height INTEGER REFERENCES blocks(height) ON DELETE SET NULL;",
+    /* Create a covering index that covers both fields */
+    "CREATE INDEX output_height_idx ON outputs (confirmation_height, spend_height);",
+    "CREATE TABLE utxoset ("
+    " txid BLOB,"
+    " outnum INT,"
+    " blockheight INT REFERENCES blocks(height) ON DELETE CASCADE,"
+    " spendheight INT REFERENCES blocks(height) ON DELETE SET NULL,"
+    " txindex INT,"
+    " scriptpubkey BLOB,"
+    " satoshis BIGINT,"
+    " PRIMARY KEY(txid, outnum));",
+    "CREATE INDEX short_channel_id ON utxoset (blockheight, txindex, outnum)",
+    /* Necessary index for long rollbacks of the blockchain, otherwise we're
+     * doing table scans for every block removed. */
+    "CREATE INDEX utxoset_spend ON utxoset (spendheight)",
+    /* Assign key 0 to unassigned shutdown_keyidx_local. */
+    "UPDATE channels SET shutdown_keyidx_local=0 WHERE shutdown_keyidx_local = -1;",
+    /* FIXME: We should rename shutdown_keyidx_local to final_key_index */
+    /* -- Payment routing failure information -- */
+    /* BLOB if failure was due to unparseable onion, NULL otherwise */
+    "ALTER TABLE payments ADD failonionreply BLOB;",
+    /* 0 if we could theoretically retry, 1 if PERM fail at payee */
+    "ALTER TABLE payments ADD faildestperm INTEGER;",
+    /* Contents of routing_failure (only if not unparseable onion) */
+    "ALTER TABLE payments ADD failindex INTEGER;", /* erring_index */
+    "ALTER TABLE payments ADD failcode INTEGER;", /* failcode */
+    "ALTER TABLE payments ADD failnode BLOB;", /* erring_node */
+    "ALTER TABLE payments ADD failchannel BLOB;", /* erring_channel */
+    "ALTER TABLE payments ADD failupdate BLOB;", /* channel_update - can be NULL*/
+    /* -- Payment routing failure information ends -- */
+    /* Delete route data for already succeeded or failed payments */
+    "UPDATE payments"
+    "   SET path_secrets = NULL"
+    "     , route_nodes = NULL"
+    "     , route_channels = NULL"
+    " WHERE status <> 0;", /* PAYMENT_PENDING */
+    /* -- Routing statistics -- */
+    "ALTER TABLE channels ADD in_payments_offered INTEGER;",
+    "ALTER TABLE channels ADD in_payments_fulfilled INTEGER;",
+    "ALTER TABLE channels ADD in_msatoshi_offered INTEGER;",
+    "ALTER TABLE channels ADD in_msatoshi_fulfilled INTEGER;",
+    "ALTER TABLE channels ADD out_payments_offered INTEGER;",
+    "ALTER TABLE channels ADD out_payments_fulfilled INTEGER;",
+    "ALTER TABLE channels ADD out_msatoshi_offered INTEGER;",
+    "ALTER TABLE channels ADD out_msatoshi_fulfilled INTEGER;",
+    "UPDATE channels"
+    "   SET  in_payments_offered = 0,  in_payments_fulfilled = 0"
+    "     ,  in_msatoshi_offered = 0,  in_msatoshi_fulfilled = 0"
+    "     , out_payments_offered = 0, out_payments_fulfilled = 0"
+    "     , out_msatoshi_offered = 0, out_msatoshi_fulfilled = 0"
+    "     ;",
+    /* -- Routing statistics ends --*/
+    /* Record the msatoshi actually sent in a payment. */
+    "ALTER TABLE payments ADD msatoshi_sent INTEGER;",
+    "UPDATE payments SET msatoshi_sent = msatoshi;",
     NULL,
 };
 
@@ -247,7 +328,7 @@ static void PRINTF_FMT(3, 4)
 	tal_free(cmd);
 }
 
-bool db_exec_prepared_mayfail_(const char *caller, struct db *db, sqlite3_stmt *stmt)
+bool db_exec_prepared_mayfail_(const char *caller UNUSED, struct db *db, sqlite3_stmt *stmt)
 {
 	assert(db->in_transaction);
 
@@ -263,7 +344,7 @@ fail:
 }
 
 sqlite3_stmt *PRINTF_FMT(3, 4)
-    db_query(const char *caller, struct db *db, const char *fmt, ...)
+    db_query(const char *caller UNUSED, struct db *db, const char *fmt, ...)
 {
 	va_list ap;
 	char *query;
@@ -281,7 +362,10 @@ sqlite3_stmt *PRINTF_FMT(3, 4)
 	return stmt;
 }
 
-static void close_db(struct db *db) { sqlite3_close(db->sql); }
+static void destroy_db(struct db *db)
+{
+	sqlite3_close(db->sql);
+}
 
 void db_begin_transaction_(struct db *db, const char *location)
 {
@@ -323,7 +407,7 @@ static struct db *db_open(const tal_t *ctx, char *filename)
 	db = tal(ctx, struct db);
 	db->filename = tal_dup_arr(db, char, filename, strlen(filename), 0);
 	db->sql = sql;
-	tal_add_destructor(db, close_db);
+	tal_add_destructor(db, destroy_db);
 	db->in_transaction = NULL;
 	db_do_exec(__func__, db, "PRAGMA foreign_keys = ON;");
 
@@ -379,15 +463,18 @@ static int db_migration_count(void)
 static void db_migrate(struct db *db, struct log *log)
 {
 	/* Attempt to read the version from the database */
-	int current, available;
+	int current, orig, available;
 
 	db_begin_transaction(db);
 
-	current = db_get_version(db);
+	orig = current = db_get_version(db);
 	available = db_migration_count();
 
 	if (current == -1)
 		log_info(log, "Creating database");
+	else if (available < current)
+		fatal("Refusing to migrate down from version %u to %u",
+		      current, available);
 	else if (current != available)
 		log_info(log, "Updating database from version %u to %u",
 			 current, available);
@@ -397,6 +484,12 @@ static void db_migrate(struct db *db, struct log *log)
 
 	/* Finally update the version number in the version table */
 	db_exec(__func__, db, "UPDATE version SET version=%d;", available);
+
+	/* Annotate that we did upgrade, if any. */
+	if (current != orig)
+		db_exec(__func__, db,
+			"INSERT INTO db_upgrades VALUES (%i, '%s');",
+			orig, version());
 
 	db_commit_transaction(db);
 }
@@ -409,11 +502,32 @@ struct db *db_setup(const tal_t *ctx, struct log *log)
 	return db;
 }
 
+void db_close_for_fork(struct db *db)
+{
+	/* https://www.sqlite.org/faq.html#q6
+	 *
+	 * Under Unix, you should not carry an open SQLite database across a
+	 * fork() system call into the child process. */
+	if (sqlite3_close(db->sql) != SQLITE_OK)
+		fatal("sqlite3_close: %s", sqlite3_errmsg(db->sql));
+	db->sql = NULL;
+}
+
+void db_reopen_after_fork(struct db *db)
+{
+	int err = sqlite3_open_v2(db->filename, &db->sql,
+				  SQLITE_OPEN_READWRITE, NULL);
+
+	if (err != SQLITE_OK) {
+		fatal("failed to re-open database %s: %s", db->filename,
+		      sqlite3_errstr(err));
+	}
+}
+
 s64 db_get_intvar(struct db *db, char *varname, s64 defval)
 {
 	int err;
 	s64 res = defval;
-	const unsigned char *stringvar;
 	sqlite3_stmt *stmt =
 	    db_query(__func__, db,
 		     "SELECT val FROM vars WHERE name='%s' LIMIT 1", varname);
@@ -423,7 +537,7 @@ s64 db_get_intvar(struct db *db, char *varname, s64 defval)
 
 	err = sqlite3_step(stmt);
 	if (err == SQLITE_ROW) {
-		stringvar = sqlite3_column_text(stmt, 0);
+		const unsigned char *stringvar = sqlite3_column_text(stmt, 0);
 		res = atol((const char *)stringvar);
 	}
 	sqlite3_finalize(stmt);
@@ -442,6 +556,24 @@ void db_set_intvar(struct db *db, char *varname, s64 val)
 		    "INSERT INTO vars (name, val) VALUES ('%s', '%" PRId64
 		    "');",
 		    varname, val);
+}
+
+void *sqlite3_column_arr_(const tal_t *ctx, sqlite3_stmt *stmt, int col,
+			  size_t bytes, const char *label, const char *caller)
+{
+	size_t sourcelen = sqlite3_column_bytes(stmt, col);
+	void *p;
+
+	if (sqlite3_column_type(stmt, col) == SQLITE_NULL)
+		return NULL;
+
+	if (sourcelen % bytes != 0)
+		fatal("%s: column size %zu not a multiple of %s (%zu)",
+		      caller, sourcelen, label, bytes);
+
+	p = tal_alloc_arr_(ctx, bytes, sourcelen / bytes, false, true, label);
+	memcpy(p, sqlite3_column_blob(stmt, col), sourcelen);
+	return p;
 }
 
 bool sqlite3_bind_short_channel_id(sqlite3_stmt *stmt, int col,
@@ -638,19 +770,26 @@ bool sqlite3_column_sha256_double(sqlite3_stmt *stmt, int col,  struct sha256_do
 struct secret *sqlite3_column_secrets(const tal_t *ctx,
 				      sqlite3_stmt *stmt, int col)
 {
-	struct secret *secrets;
-	size_t n = sqlite3_column_bytes(stmt, col) / sizeof(*secrets);
-
-	/* Must fit exactly */
-	assert(n * sizeof(struct secret) == sqlite3_column_bytes(stmt, col));
-	if (n == 0)
-		return NULL;
-	secrets = tal_arr(ctx, struct secret, n);
-	return memcpy(secrets, sqlite3_column_blob(stmt, col), tal_len(secrets));
+	return sqlite3_column_arr(ctx, stmt, col, struct secret);
 }
 
 bool sqlite3_bind_sha256_double(sqlite3_stmt *stmt, int col, const struct sha256_double *p)
 {
 	sqlite3_bind_blob(stmt, col, p, sizeof(struct sha256_double), SQLITE_TRANSIENT);
+	return true;
+}
+
+struct json_escaped *sqlite3_column_json_escaped(const tal_t *ctx,
+						 sqlite3_stmt *stmt, int col)
+{
+	return json_escaped_string_(ctx,
+				    sqlite3_column_blob(stmt, col),
+				    sqlite3_column_bytes(stmt, col));
+}
+
+bool sqlite3_bind_json_escaped(sqlite3_stmt *stmt, int col,
+			       const struct json_escaped *esc)
+{
+	sqlite3_bind_text(stmt, col, esc->s, strlen(esc->s), SQLITE_TRANSIENT);
 	return true;
 }
