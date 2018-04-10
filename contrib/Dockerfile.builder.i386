@@ -11,6 +11,7 @@ RUN apt-get -qq update && \
 	automake \
 	clang \
 	cppcheck \
+	shellcheck \
 	eatmydata \
 	software-properties-common \
 	build-essential \
@@ -28,6 +29,7 @@ RUN apt-get -qq update && \
 	python3-pip \
 	python3-setuptools \
 	python-pkg-resources \
+	shellcheck \
 	wget && \
 	rm -rf /var/lib/apt/lists/*
 

@@ -636,6 +636,8 @@ static struct channel *wallet_stmt2channel(const tal_t *ctx, struct wallet *w, s
 			   sqlite3_column_int(stmt, 15) != 0,
 			   scid,
 			   sqlite3_column_int64(stmt, 17),
+			   sqlite3_column_int64(stmt, 38), /* msatoshi_to_us_min */
+			   sqlite3_column_int64(stmt, 39), /* msatoshi_to_us_max */
 			   sqlite3_column_tx(tmpctx, stmt, 32),
 			   &last_sig,
 			   wallet_htlc_sigs_load(tmpctx, w,
@@ -645,27 +647,33 @@ static struct channel *wallet_stmt2channel(const tal_t *ctx, struct wallet *w, s
 			   final_key_idx,
 			   sqlite3_column_int(stmt, 34) != 0,
 			   last_sent_commit,
-			   sqlite3_column_int64(stmt, 35));
+			   sqlite3_column_int64(stmt, 35),
+			   sqlite3_column_int(stmt, 36),
+			   sqlite3_column_int(stmt, 37));
 
 	return chan;
 }
 
 /* List of fields to retrieve from the channels DB table, in the order
  * that wallet_stmt2channel understands and will parse correctly */
+/* Numbers below are sqlite3_column indices for the first field
+ * of that line. */
 static const char *channel_fields =
-    "id, peer_id, short_channel_id, channel_config_local, "
-    "channel_config_remote, state, funder, channel_flags, "
-    "minimum_depth, "
-    "next_index_local, next_index_remote, "
-    "next_htlc_id, funding_tx_id, funding_tx_outnum, funding_satoshi, "
-    "funding_locked_remote, push_msatoshi, msatoshi_local, "
-    "fundingkey_remote, revocation_basepoint_remote, "
-    "payment_basepoint_remote, htlc_basepoint_remote, "
-    "delayed_payment_basepoint_remote, per_commit_remote, "
-    "old_per_commit_remote, local_feerate_per_kw, remote_feerate_per_kw, shachain_remote_id, "
-    "shutdown_scriptpubkey_remote, shutdown_keyidx_local, "
-    "last_sent_commit_state, last_sent_commit_id, "
-    "last_tx, last_sig, last_was_revoke, first_blocknum";
+    /*0*/ "id, peer_id, short_channel_id, channel_config_local, "
+    /*4*/ "channel_config_remote, state, funder, channel_flags, "
+    /*8*/ "minimum_depth, "
+    /*9*/ "next_index_local, next_index_remote, "
+    /*11*/ "next_htlc_id, funding_tx_id, funding_tx_outnum, funding_satoshi, "
+    /*15*/ "funding_locked_remote, push_msatoshi, msatoshi_local, "
+    /*18*/ "fundingkey_remote, revocation_basepoint_remote, "
+    /*20*/ "payment_basepoint_remote, htlc_basepoint_remote, "
+    /*22*/ "delayed_payment_basepoint_remote, per_commit_remote, "
+    /*24*/ "old_per_commit_remote, local_feerate_per_kw, remote_feerate_per_kw, shachain_remote_id, "
+    /*28*/ "shutdown_scriptpubkey_remote, shutdown_keyidx_local, "
+    /*30*/ "last_sent_commit_state, last_sent_commit_id, "
+    /*32*/ "last_tx, last_sig, last_was_revoke, first_blocknum, "
+    /*36*/ "min_possible_feerate, max_possible_feerate, "
+    /*38*/ "msatoshi_to_us_min, msatoshi_to_us_max ";
 
 bool wallet_channels_load_active(const tal_t *ctx, struct wallet *w)
 {
@@ -818,6 +826,10 @@ u32 wallet_first_blocknum(struct wallet *w, u32 first_possible)
 	first_utxo = db_get_intvar(w->db, "last_processed_block", UINT32_MAX);
 #endif
 
+	/* Never go below the start of the Lightning Network */
+	if (first_utxo < first_possible)
+		first_utxo = first_possible;
+
 	if (first_utxo < first_channel)
 		return first_utxo;
 	else
@@ -918,7 +930,11 @@ void wallet_channel_save(struct wallet *w, struct channel *chan)
 			  "  shutdown_keyidx_local=?,"
 			  "  channel_config_local=?,"
 			  "  last_tx=?, last_sig=?,"
-			  "  last_was_revoke=?"
+			  "  last_was_revoke=?,"
+			  "  min_possible_feerate=?,"
+			  "  max_possible_feerate=?,"
+			  "  msatoshi_to_us_min=?,"
+			  "  msatoshi_to_us_max=?"
 			  " WHERE id=?");
 	sqlite3_bind_int64(stmt, 1, chan->their_shachain.id);
 	if (chan->scid)
@@ -950,7 +966,11 @@ void wallet_channel_save(struct wallet *w, struct channel *chan)
 	sqlite3_bind_tx(stmt, 19, chan->last_tx);
 	sqlite3_bind_signature(stmt, 20, &chan->last_sig);
 	sqlite3_bind_int(stmt, 21, chan->last_was_revoke);
-	sqlite3_bind_int64(stmt, 22, chan->dbid);
+	sqlite3_bind_int(stmt, 22, chan->min_possible_feerate);
+	sqlite3_bind_int(stmt, 23, chan->max_possible_feerate);
+	sqlite3_bind_int64(stmt, 24, chan->msatoshi_to_us_min);
+	sqlite3_bind_int64(stmt, 25, chan->msatoshi_to_us_max);
+	sqlite3_bind_int64(stmt, 26, chan->dbid);
 	db_exec_prepared(w->db, stmt);
 
 	wallet_channel_config_save(w, &chan->channel_info.their_config);
@@ -2011,15 +2031,18 @@ void wallet_block_remove(struct wallet *w, struct block *b)
 void wallet_blocks_rollback(struct wallet *w, u32 height)
 {
 	sqlite3_stmt *stmt = db_prepare(w->db, "DELETE FROM blocks "
-					"WHERE height >= ?");
+					"WHERE height > ?");
 	sqlite3_bind_int(stmt, 1, height);
 	db_exec_prepared(w->db, stmt);
 }
 
-void wallet_outpoint_spend(struct wallet *w, const u32 blockheight,
-			   const struct bitcoin_txid *txid, const u32 outnum)
+const struct short_channel_id *
+wallet_outpoint_spend(struct wallet *w, const tal_t *ctx, const u32 blockheight,
+		      const struct bitcoin_txid *txid, const u32 outnum)
 {
+	struct short_channel_id *scid;
 	sqlite3_stmt *stmt;
+	int res;
 	if (outpointfilter_matches(w->owned_outpoints, txid, outnum)) {
 		stmt = db_prepare(w->db,
 				  "UPDATE outputs "
@@ -2046,7 +2069,29 @@ void wallet_outpoint_spend(struct wallet *w, const u32 blockheight,
 		sqlite3_bind_int(stmt, 3, outnum);
 
 		db_exec_prepared(w->db, stmt);
+
+		if (sqlite3_changes(w->db->sql) == 0) {
+			return NULL;
+		}
+
+		/* Now look for the outpoint's short_channel_id */
+		stmt = db_prepare(w->db,
+				  "SELECT blockheight, txindex "
+				  "FROM utxoset "
+				  "WHERE txid = ? AND outnum = ?");
+		sqlite3_bind_sha256_double(stmt, 1, &txid->shad);
+		sqlite3_bind_int(stmt, 2, outnum);
+
+		res = sqlite3_step(stmt);
+		assert(res == SQLITE_ROW);
+
+		scid = tal(ctx, struct short_channel_id);
+		mk_short_channel_id(scid, sqlite3_column_int(stmt, 0),
+				    sqlite3_column_int(stmt, 1), outnum);
+		sqlite3_finalize(stmt);
+		return scid;
 	}
+	return NULL;
 }
 
 void wallet_utxoset_add(struct wallet *w, const struct bitcoin_tx *tx,

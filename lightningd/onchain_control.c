@@ -417,7 +417,9 @@ enum watch_result funding_spent(struct channel *channel,
 				  /* FIXME: config for 'reasonable depth' */
 				  3,
 				  channel->last_htlc_sigs,
-				  tal_count(stubs));
+				  tal_count(stubs),
+				  channel->min_possible_feerate,
+				  channel->max_possible_feerate);
 	subd_send_msg(channel->owner, take(msg));
 
 	/* FIXME: Don't queue all at once, use an empty cb... */

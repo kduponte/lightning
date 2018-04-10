@@ -176,7 +176,7 @@ get_channel(const struct routing_state *rstate,
 struct route_hop {
 	struct short_channel_id channel_id;
 	struct pubkey nodeid;
-	u32 amount;
+	u64 amount;
 	u32 delay;
 };
 
@@ -238,7 +238,7 @@ struct node *get_node(struct routing_state *rstate, const struct pubkey *id);
 struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
 			    const struct pubkey *source,
 			    const struct pubkey *destination,
-			    const u32 msatoshi, double riskfactor,
+			    const u64 msatoshi, double riskfactor,
 			    u32 final_cltv,
 			    double fuzz,
 			    const struct siphash_seed *base_seed);
@@ -286,7 +286,7 @@ void routing_add_channel_update(struct routing_state *rstate,
  * it. This must be from a trusted source, e.g., gossip_store. For untrusted
  * sources (peers) please use @see{handle_node_announcement}.
  */
-void routing_add_node_announcement(struct routing_state *rstate,
+bool routing_add_node_announcement(struct routing_state *rstate,
                                   const u8 *msg TAKES);
 
 #endif /* LIGHTNING_GOSSIPD_ROUTING_H */

@@ -16,6 +16,7 @@
 #include <common/timeout.h>
 #include <common/utils.h>
 #include <inttypes.h>
+#include <lightningd/gossip_control.h>
 
 /* Mutual recursion via timer. */
 static void try_extend_tip(struct chain_topology *topo);
@@ -406,13 +407,18 @@ static void updates_complete(struct chain_topology *topo)
  */
 static void topo_update_spends(struct chain_topology *topo, struct block *b)
 {
+	const struct short_channel_id *scid;
 	for (size_t i = 0; i < tal_count(b->full_txs); i++) {
 		const struct bitcoin_tx *tx = b->full_txs[i];
 		for (size_t j = 0; j < tal_count(tx->input); j++) {
 			const struct bitcoin_tx_input *input = &tx->input[j];
-			wallet_outpoint_spend(topo->wallet, b->height,
-					      &input->txid,
-					      input->index);
+			scid = wallet_outpoint_spend(topo->wallet, tmpctx,
+						     b->height, &input->txid,
+						     input->index);
+			if (scid) {
+				gossipd_notify_spend(topo->bitcoind->ld, scid);
+				tal_free(scid);
+			}
 		}
 	}
 }
@@ -567,7 +573,7 @@ static void get_init_blockhash(struct bitcoind *bitcoind, u32 blockcount,
 
 	/* Rollback to the given blockheight, so we start track
 	 * correctly again */
-	wallet_blocks_rollback(topo->wallet, topo->first_blocknum - 1);
+	wallet_blocks_rollback(topo->wallet, topo->first_blocknum);
 
 	/* Get up to speed with topology. */
 	bitcoind_getblockhash(bitcoind, topo->first_blocknum,
